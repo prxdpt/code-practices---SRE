@@ -1,0 +1,209 @@
+version: '3.9'
+
+services:
+
+  # ────────────────────────────────────────────────
+  #  Traefik (reverse proxy + dashboard)
+  # ────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "8080:8080"           # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    networks:
+      - frontend
+      - monitoring
+
+  # ────────────────────────────────────────────────
+  #  Main application (FastAPI / Flask / whatever)
+  # ────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: mycompany/app:2025-latest
+    container_name: app-main
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - APP_ENV=production
+      - DATABASE_URL=postgresql://appuser:supersecret@db:5432/appdb
+      - REDIS_URL=redis://redis:6379/0
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
+    volumes:
+      - prometheus-multiproc:/tmp/prometheus
+    command: >
+      python -m uvicorn main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 4
+        --limit-concurrency 48
+        --timeout-keep-alive 65
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 12s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Host(`app.localhost`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.services.app.loadbalancer.server.port=8000"
+    networks:
+      - backend
+      - frontend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.90'
+          memory: 850M
+        reservations:
+          cpus: '0.40'
+          memory: 350M
+
+  # ────────────────────────────────────────────────
+  #  Celery worker
+  # ────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: mycompany/app:2025-latest
+    container_name: app-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - db
+    environment:
+      <<: *app-env
+    command: celery -A tasks worker --loglevel=info -c 3 -Q default,high-priority
+    networks:
+      - backend
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.70'
+          memory: 650M
+
+  # ────────────────────────────────────────────────
+  #  Celery beat (scheduler)
+  # ────────────────────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: mycompany/app:2025-latest
+    container_name: app-beat
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      <<: *app-env
+    command: celery -A tasks beat --loglevel=info --scheduler redbeat.RedBeatScheduler
+    networks:
+      - backend
+
+  # ────────────────────────────────────────────────
+  #  Flower (Celery monitoring dashboard)
+  # ────────────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: mycompany/app:2025-latest
+    container_name: flower
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      <<: *app-env
+    command: celery -A tasks flower --port=5555 --basic_auth=admin:flowersupersecret
+    ports:
+      - "5555:5555"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.flower.rule=Host(`flower.localhost`)"
+      - "traefik.http.routers.flower.entrypoints=web"
+      - "traefik.http.services.flower.loadbalancer.server.port=5555"
+    networks:
+      - frontend
+      - backend
+
+  # ────────────────────────────────────────────────
+  #  Redis (broker + result backend)
+  # ────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+
+  # ────────────────────────────────────────────────
+  #  PostgreSQL
+  # ────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: supersecret
+      POSTGRES_DB: appdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 8s
+      timeout: 5s
+      retries: 6
+    networks:
+      - backend
+
+x-app-env: &app-env
+  PYTHONUNBUFFERED: "1"
+  APP_ENV: production
+  DATABASE_URL: postgresql://appuser:supersecret@db:5432/appdb
+  REDIS_URL: redis://redis:6379/0
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+  monitoring:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redis-data:
+  prometheus-multiproc:
